@@ -1,0 +1,1029 @@
+---
+title: "Stochastic SIR Epidemic Simulations"
+author: "Julia"
+date: "2025-07-21"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+# Introduction
+
+Epidemic models provide a mathematical framework for understanding how infectious diseases spread through populations. In this paper we use a stochastic version of the classic SIR (Susceptible–Infected–Recovered) compartmental model. Unlike deterministic models that produce a single fixed trajectory, the stochastic version introduces randomness at each time step, capturing the natural variability observed in real outbreaks. Even with identical starting conditions, no two epidemic trajectories unfold in exactly the same way.
+
+We simulate 500 independent runs of the model under each set of conditions and examine the distribution of outcomes. The analysis covers four main components:
+
+1. **Baseline simulation**: A single scenario describing the structure of the model output.
+2. **Epidemic speed**: Comparing fast and slow epidemics by varying the infection rate $\beta$.
+3. **Population size**: Examining how N = 500, 5,000, and 50,000 affect trajectory variability.
+4. **Smoothing**: Comparing 3-, 5-, and 7-day rolling averages of daily incidence.
+
+# Methods
+
+## The Stochastic SIR Model
+
+The population of size $N$ is divided into three compartments at each time step $t$: $S_t$ (susceptible), $I_t$ (infected), and $R_t$ (recovered). At each step, two random processes occur.
+
+**New infections.** The probability that a susceptible person becomes infected depends on both the fraction susceptible and the fraction infected in the current time step:
+$$p_{\text{inf}} = \beta \cdot \frac{S_t}{N} \cdot \frac{I_t}{N}$$
+The number of new infections is drawn from a binomial distribution:
+$$\Delta S_t \sim \text{Binomial}(S_t,\; p_{\text{inf}})$$
+
+**New recoveries.** Each infected person recovers independently with probability $\gamma$ per day:
+$$\Delta R_t \sim \text{Binomial}(I_t,\; \gamma)$$
+
+The compartments then update as:
+$$S_{t+1} = S_t - \Delta S_t, \quad I_{t+1} = I_t + \Delta S_t - \Delta R_t, \quad R_{t+1} = N - S_{t+1} - I_{t+1}$$
+
+The basic reproduction number is $R_0 = \beta / \gamma$. Values above 1 lead to epidemic growth; values below 1 cause the outbreak to fade.
+
+## Smoothing Daily Incidence
+
+Daily new infections are noisy, especially in small populations. We smooth them using rolling averages of width 3, 5, and 7 days. Each value is the mean of the current and preceding $k-1$ days (right-aligned), so the smoothed value at day $t$ does not use any future information.
+
+## Log-Log Representation
+
+A useful way to visualize epidemic dynamics is to plot the rolling average of daily new infections against cumulative infections, on a log-log scale. During exponential growth this appears as a straight upward line; when the epidemic peaks and new cases fall, the curve bends downward. The inflection point corresponds to the epidemic peak.
+
+## Parameters
+
+The table below summarizes the parameters used across all scenarios.
+
+| Parameter | Symbol | Value(s) |
+|---|---|---|
+| Infection rate | $\beta$ | 0.15, 0.30, 0.60 |
+| Recovery rate | $\gamma$ | 0.10 |
+| Initial susceptible proportion | $S_0$ | 0.99 |
+| Initial infected proportion | $I_0$ | 0.01 |
+| Time steps (baseline/pop size) | $T$ | 50 |
+| Time steps (speed comparison) | $T$ | 100 |
+| Simulations per scenario | $n_{\text{sim}}$ | 500 |
+
+# Simulation Setup
+
+```{r libraries}
+library(dplyr)
+library(ggplot2)
+library(zoo)
+library(tidyr)
+```
+
+The simulation is encapsulated in a reusable function so it can be called with different parameters for each scenario without repeating code.
+
+```{r simulation-functions}
+run_sir_simulation <- function(beta, gamma = 0.1, N = 500,
+                               S0 = 0.99, I0 = 0.01,
+                               T = 50, n_sim = 500, seed = 12345) {
+  set.seed(seed)
+  df_list <- list()
+  for (sim in 1:n_sim) {
+    NS0 <- rbinom(1, N, S0)
+    NI0 <- rbinom(1, N - NS0, min(I0 / (1 - S0), 1))
+    NR0 <- N - NS0 - NI0
+
+    NSt <- numeric(T + 1)
+    NIt <- numeric(T + 1)
+    NRt <- numeric(T + 1)
+    N_new_infections <- numeric(T + 1)
+
+    NSt[1] <- NS0
+    NIt[1] <- NI0
+    NRt[1] <- NR0
+
+    for (t in 2:(T + 1)) {
+      S_prev <- NSt[t - 1]
+      I_prev <- NIt[t - 1]
+
+      p_infection <- beta * (S_prev / N) * (I_prev / N)
+      p_infection <- min(max(p_infection, 0), 1)
+
+      DeltaNSt <- rbinom(1, S_prev, p_infection)
+      DeltaNIt <- rbinom(1, I_prev, gamma)
+
+      NSt[t] <- max(S_prev - DeltaNSt, 0)
+      NIt[t] <- max(I_prev + DeltaNSt - DeltaNIt, 0)
+      NRt[t] <- N - NSt[t] - NIt[t]
+      N_new_infections[t] <- DeltaNSt
+    }
+
+    df_list[[sim]] <- data.frame(
+      time             = 0:T,
+      simulation       = sim,
+      S                = NSt,
+      I                = NIt,
+      R                = NRt,
+      N_new_infections = N_new_infections,
+      N_pop            = N
+    )
+  }
+  bind_rows(df_list)
+}
+
+add_rolling_avg <- function(df) {
+  df %>%
+    arrange(simulation, time) %>%
+    group_by(simulation) %>%
+    mutate(
+      I_3day_avg   = rollmean(N_new_infections, k = 3, fill = NA, align = "right"),
+      I_5day_avg   = rollmean(N_new_infections, k = 5, fill = NA, align = "right"),
+      I_7day_avg   = rollmean(N_new_infections, k = 7, fill = NA, align = "right"),
+      cumulative_I = cumsum(N_new_infections),
+      S_prop       = S / N_pop,
+      I_prop       = I / N_pop,
+      new_I_prop   = N_new_infections / N_pop
+    ) %>%
+    ungroup() %>%
+    mutate(
+      log_cumI  = log(cumulative_I),
+      log_3dayI = log(I_3day_avg),
+      log_5dayI = log(I_5day_avg),
+      log_7dayI = log(I_7day_avg)
+    )
+}
+```
+
+# Results
+
+## Baseline Simulation
+
+The baseline scenario uses $\beta = 0.3$, $\gamma = 0.1$, and a population of $N = 500$, giving $R_0 = 3$. We run 500 independent simulations, each starting with approximately 1% of the population infected and 99% susceptible.
+
+```{r baseline-sim}
+sim_df <- run_sir_simulation(beta = 0.3, N = 500, T = 50, n_sim = 500)
+sim_df <- add_rolling_avg(sim_df)
+
+mean_df <- sim_df %>%
+  group_by(time) %>%
+  summarise(
+    S                = mean(S),
+    I                = mean(I),
+    R                = mean(R),
+    N_new_infections = mean(N_new_infections),
+    I_5day_avg       = mean(I_5day_avg, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+Figure 1 shows all 500 simulated SIR trajectories. Each line is drawn at low opacity so that the full distribution of outcomes is visible as a density cloud. The bold lines show the mean trajectory. The susceptible population (blue) declines steadily as infections accumulate. The infected compartment (red) rises, peaks, then falls as the pool of susceptibles is exhausted. Daily new infections (green) show the incidence curve.
+
+```{r baseline-plot-sir, fig.cap="SIR trajectories for 500 simulations with mean trajectory overlaid. Baseline: beta = 0.3, N = 500."}
+ggplot(sim_df, aes(x = time)) +
+  geom_line(aes(y = S,                group = simulation), color = "darkblue",  alpha = 0.02) +
+  geom_line(aes(y = I,                group = simulation), color = "red",       alpha = 0.02) +
+  geom_line(aes(y = N_new_infections, group = simulation), color = "darkgreen", alpha = 0.02) +
+  geom_line(data = mean_df, aes(y = S),                color = "darkblue",  size = 0.9) +
+  geom_line(data = mean_df, aes(y = I),                color = "red",       size = 0.9) +
+  geom_line(data = mean_df, aes(y = N_new_infections), color = "darkgreen", size = 0.9) +
+  labs(
+    title    = "Baseline SIR Model (N = 500, beta = 0.3)",
+    subtitle = "Blue = Susceptible, Red = Infected, Green = Daily New Infections",
+    x        = "Time (days)",
+    y        = "Population Count"
+  ) +
+  theme_minimal()
+```
+
+Figure 2 shows the log-log plot of smoothed new infections against cumulative infections, with the epidemic peak in each simulation marked as a black dot. The curve rises steeply during exponential growth, then bends and turns downward after the peak.
+
+```{r baseline-loglog, fig.cap="Log-log plot: 5-day rolling avg new infections vs. cumulative infections. Dots mark the peak of each simulation."}
+sim_df <- sim_df %>%
+  group_by(simulation) %>%
+  mutate(peak_time = time[which.max(I_5day_avg)[1]]) %>%
+  ungroup()
+
+peak_points <- sim_df %>%
+  filter(time == peak_time) %>%
+  filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+ggplot(sim_df, aes(x = log_cumI, y = log_5dayI, group = simulation)) +
+  geom_line(alpha = 0.1, color = "purple") +
+  geom_point(data = peak_points, aes(x = log_cumI, y = log_5dayI),
+             color = "black", size = 1.5, alpha = 0.5) +
+  labs(
+    title    = "Log-Log Plot with Epidemic Peaks",
+    subtitle = "Black dots mark the smoothed incidence peak in each simulation",
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Infections)"
+  ) +
+  theme_minimal()
+```
+
+A natural follow-up question is: on which day of the simulation does the log-log curve actually turn? The peak dots above tell us *where* in log-log space the inflection happens, but not *when*. Figure 3 repeats the same plot with peak dots colored by the day the peak occurred, earlier peaks are shown in blue and later peaks in red. Figure 4 shows the distribution of peak times as a histogram.
+
+```{r baseline-loglog-timing, fig.cap="Log-log plot with peak dots colored by the day the peak occurred. Blue = early peak, red = late peak."}
+ggplot(sim_df, aes(x = log_cumI, y = log_5dayI, group = simulation)) +
+  geom_line(alpha = 0.1, color = "purple") +
+  geom_point(data = peak_points, aes(x = log_cumI, y = log_5dayI, color = peak_time),
+             size = 2, alpha = 0.7) +
+  scale_color_gradient(low = "blue", high = "red", name = "Peak day") +
+  labs(
+    title    = "Log-Log Plot: Peak Timing",
+    subtitle = "Each dot is one simulation's peak; color shows the day it occurred",
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Infections)"
+  ) +
+  theme_minimal()
+```
+
+```{r baseline-peak-hist, fig.cap="Distribution of peak days across 500 simulations. The vertical line marks the median peak day."}
+median_peak <- median(peak_points$peak_time)
+
+ggplot(peak_points, aes(x = peak_time)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = median_peak, color = "red", linetype = "dashed", size = 0.8) +
+  annotate("text", x = median_peak + 0.5, y = Inf, label = paste("Median =", median_peak),
+           hjust = 0, vjust = 1.5, color = "red", size = 3.5) +
+  labs(
+    title = "Distribution of Epidemic Peak Days",
+    x     = "Day of Peak (5-Day Rolling Avg)",
+    y     = "Number of Simulations"
+  ) +
+  theme_minimal()
+```
+
+## The Log-Log Inflection as a Leading Indicator
+
+The log-log curve turns downward at the moment smoothed new infections peak. But this is not the same as the peak of *total* infected individuals ($I$). Because people who were infected in previous days are still sick and haven't yet recovered, the $I$ compartment keeps rising for several days after daily new cases have already begun to fall. This means the log-log signal arrives *before* the worst of the epidemic burden (hospitalizations, total caseload) has peaked.
+
+Figure 5 illustrates this with a single example simulation, showing all three quantities on the same time axis: raw daily new infections, the 5-day rolling average (which the log-log y-axis tracks), and total infected $I$. The three vertical lines mark each peak. Figure 6 then quantifies the lag across all 500 simulations.
+
+```{r leading-indicator-example, fig.cap="Single simulation showing the three epidemic peaks. The log-log inflection (peak of smoothed new infections) precedes peak total infected by several days."}
+# Pick one representative simulation near the median peak time
+example_sim <- peak_points %>%
+  mutate(dist = abs(peak_time - median_peak)) %>%
+  arrange(dist) %>%
+  slice(1) %>%
+  pull(simulation)
+
+example_df <- sim_df %>% filter(simulation == example_sim)
+
+peak_raw    <- example_df$time[which.max(example_df$N_new_infections)]
+peak_smooth <- example_df$time[which.max(example_df$I_5day_avg)]
+peak_I      <- example_df$time[which.max(example_df$I)]
+
+# Reshape to long for clean plotting
+example_long <- example_df %>%
+  select(time, N_new_infections, I_5day_avg, I) %>%
+  pivot_longer(-time, names_to = "series", values_to = "value") %>%
+  mutate(series = recode(series,
+    N_new_infections = "Daily new infections (raw)",
+    I_5day_avg       = "5-day rolling avg (log-log signal)",
+    I                = "Total infected (I)"
+  ))
+
+vlines <- data.frame(
+  xintercept = c(peak_raw, peak_smooth, peak_I),
+  series = c("Daily new infections (raw)",
+             "5-day rolling avg (log-log signal)",
+             "Total infected (I)")
+)
+
+ggplot(example_long, aes(x = time, y = value, color = series)) +
+  geom_line(size = 0.9) +
+  geom_vline(data = vlines, aes(xintercept = xintercept, color = series),
+             linetype = "dashed", size = 0.7) +
+  scale_color_manual(values = c(
+    "Daily new infections (raw)"        = "darkgreen",
+    "5-day rolling avg (log-log signal)"= "purple",
+    "Total infected (I)"                = "red"
+  )) +
+  labs(
+    title    = "Three Epidemic Peaks in a Single Simulation",
+    subtitle = "Dashed lines mark the day each series peaks",
+    x        = "Time (days)",
+    y        = "Count",
+    color    = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r leading-indicator-lag, fig.cap="Distribution of the lag between the log-log inflection (peak smoothed new infections) and peak total infected, across 500 simulations. Positive values mean the log-log signal precedes peak I."}
+# For each simulation compute peak of I and peak of smoothed new infections
+lag_df <- sim_df %>%
+  group_by(simulation) %>%
+  summarise(
+    peak_smooth = time[which.max(I_5day_avg)[1]],
+    peak_I      = time[which.max(I)[1]],
+    .groups = "drop"
+  ) %>%
+  mutate(lag = peak_I - peak_smooth)
+
+median_lag <- median(lag_df$lag)
+
+ggplot(lag_df, aes(x = lag)) +
+  geom_histogram(binwidth = 1, fill = "coral", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = median_lag, color = "black", linetype = "dashed", size = 0.8) +
+  annotate("text", x = median_lag + 0.3, y = Inf,
+           label = paste("Median lag =", median_lag, "days"),
+           hjust = 0, vjust = 1.5, size = 3.5) +
+  labs(
+    title    = "Lag Between Log-Log Inflection and Peak Total Infected",
+    subtitle = "Positive = log-log signal precedes peak I",
+    x        = "Lag (days): peak I minus peak smoothed new infections",
+    y        = "Number of Simulations"
+  ) +
+  theme_minimal()
+```
+
+## Fast and Slow Epidemics
+
+To understand how transmission speed affects epidemic shape, we compare three scenarios with substantially different parameter combinations. The fast epidemic uses a high infection rate, producing explosive early growth. The slow epidemic uses both a low infection rate and a low recovery rate (longer infectious period), which keeps $R_0$ safely above 1, so the epidemic reliably takes off, while dramatically slowing the pace of spread:
+
+- **Fast** ($\beta = 0.8$, $\gamma = 0.1$, $R_0 = 8$, $I_0 = 2\%$): explosive spread, expected peak around day 6–8.
+- **Baseline** ($\beta = 0.3$, $\gamma = 0.1$, $R_0 = 3$, $I_0 = 1\%$): moderate spread, expected peak around day 18–22.
+- **Slow** ($\beta = 0.10$, $\gamma = 0.03$, $R_0 = 3.3$, $I_0 = 5\%$): slow buildup despite $R_0 > 1$, expected peak around day 45–60.
+
+The slow scenario uses a higher $I_0$ to prevent stochastic extinction in the early phase, which would otherwise occur frequently when very few individuals are infected and growth is slow. We extend the time horizon to 120 days to allow all scenarios to fully resolve.
+
+```{r speed-sim}
+fast_df <- run_sir_simulation(beta = 0.80, gamma = 0.10, S0 = 0.98, I0 = 0.02, N = 500, T = 120, n_sim = 500)
+base_df <- run_sir_simulation(beta = 0.30, gamma = 0.10, S0 = 0.99, I0 = 0.01, N = 500, T = 120, n_sim = 500)
+slow_df <- run_sir_simulation(beta = 0.10, gamma = 0.03, S0 = 0.95, I0 = 0.05, N = 500, T = 120, n_sim = 500)
+
+fast_df$scenario <- "Fast (beta=0.8, R0=8)"
+base_df$scenario <- "Baseline (beta=0.3, R0=3)"
+slow_df$scenario <- "Slow (beta=0.10, R0=3.3)"
+
+speed_df <- bind_rows(
+  add_rolling_avg(fast_df),
+  add_rolling_avg(base_df),
+  add_rolling_avg(slow_df)
+) %>%
+  mutate(scenario = factor(scenario, levels = c(
+    "Fast (beta=0.8, R0=8)",
+    "Baseline (beta=0.3, R0=3)",
+    "Slow (beta=0.10, R0=3.3)"
+  )))
+
+speed_mean <- speed_df %>%
+  group_by(scenario, time) %>%
+  summarise(I_5day_avg = mean(I_5day_avg, na.rm = TRUE), .groups = "drop")
+```
+
+Figure 3 compares the 5-day rolling average of new infections across all three scenarios. The fast epidemic peaks sharply within the first week; the baseline peaks around day 20; the slow epidemic takes over 45 days to reach its peak. The fast epidemic also produces a taller, narrower curve while the slow epidemic spreads the same process over a much longer period, producing a flatter curve.
+
+```{r speed-plot, fig.cap="5-day rolling average of new infections for fast, baseline, and slow epidemic scenarios. Transparent lines are individual simulations; bold line is the mean."}
+ggplot(speed_df, aes(x = time, y = I_5day_avg, group = interaction(simulation, scenario))) +
+  geom_line(alpha = 0.05, color = "steelblue") +
+  geom_line(data = speed_mean, aes(x = time, y = I_5day_avg, group = scenario),
+            color = "black", size = 0.9) +
+  facet_wrap(~scenario) +
+  labs(
+    title = "Fast vs. Slow Epidemics: 5-Day Rolling Avg New Infections",
+    x     = "Time (days)",
+    y     = "5-Day Avg New Infections"
+  ) +
+  theme_minimal()
+```
+
+Figure 4 shows the log-log representation for all three scenarios. The slope during the growth phase is steeper for faster epidemics, reflecting faster exponential growth. After the peak, all curves turn downward in a similar shape, but the fast epidemic peaks at a much earlier point on the x-axis (fewer cumulative infections have accumulated when the peak occurs as a fraction of the total trajectory).
+
+```{r speed-loglog, fig.cap="Log-log plot by epidemic speed. Black dots mark the peak of each simulation."}
+speed_df <- speed_df %>%
+  group_by(scenario, simulation) %>%
+  mutate(peak_time = time[which.max(I_5day_avg)[1]]) %>%
+  ungroup()
+
+speed_peaks <- speed_df %>%
+  filter(time == peak_time) %>%
+  filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+ggplot(speed_df, aes(x = log_cumI, y = log_5dayI, group = interaction(simulation, scenario))) +
+  geom_line(alpha = 0.05, color = "steelblue") +
+  geom_point(data = speed_peaks, aes(x = log_cumI, y = log_5dayI),
+             color = "black", size = 1, alpha = 0.4) +
+  facet_wrap(~scenario) +
+  labs(
+    title = "Log-Log Plot by Epidemic Speed",
+    x     = "log(Cumulative Infections)",
+    y     = "log(5-Day Avg New Infections)"
+  ) +
+  theme_minimal()
+```
+
+## Effect of Population Size
+
+Population size affects stochastic epidemics in two important ways. First, larger populations produce smoother, more predictable trajectories, random fluctuations average out more effectively when $N$ is large, and the model approaches its deterministic ODE limit. Second, while the absolute counts scale with $N$, the proportions should behave similarly across sizes if the rates $\beta$ and $\gamma$ are held constant.
+
+We compare $N = 500$, $N = 5{,}000$, and $N = 50{,}000$ with all other parameters fixed.
+
+```{r popsize-sim}
+small_df  <- run_sir_simulation(beta = 0.3, N = 500,   T = 50, n_sim = 500)
+medium_df <- run_sir_simulation(beta = 0.3, N = 5000,  T = 50, n_sim = 500)
+large_df  <- run_sir_simulation(beta = 0.3, N = 50000, T = 50, n_sim = 500)
+
+small_df$scenario  <- "N = 500"
+medium_df$scenario <- "N = 5,000"
+large_df$scenario  <- "N = 50,000"
+
+popsize_df <- bind_rows(small_df, medium_df, large_df) %>%
+  mutate(scenario = factor(scenario, levels = c("N = 500", "N = 5,000", "N = 50,000")))
+
+popsize_df <- add_rolling_avg(popsize_df)
+
+popsize_df <- popsize_df %>%
+  mutate(I_5day_prop = I_5day_avg / N_pop)
+
+popsize_mean <- popsize_df %>%
+  group_by(scenario, time) %>%
+  summarise(I_5day_prop = mean(I_5day_prop, na.rm = TRUE), .groups = "drop")
+```
+
+Figure 5 plots the proportion of the population with new infections each day (5-day rolling average), normalizing for population size so that trajectories are directly comparable. The mean trajectory is nearly identical across all three sizes, confirming that the model's average behavior is governed by $\beta$ and $\gamma$ rather than $N$. However, the variability around the mean shrinks dramatically as $N$ increases with $N = 50{,}000$, individual runs are nearly indistinguishable from one another.
+
+```{r popsize-plot, fig.cap="Proportion of population with new daily infections (5-day rolling average), by population size. Variability decreases markedly as N increases."}
+ggplot(popsize_df, aes(x = time, y = I_5day_prop, group = simulation)) +
+  geom_line(alpha = 0.05, color = "coral") +
+  geom_line(data = popsize_mean, aes(x = time, y = I_5day_prop, group = scenario),
+            color = "black", size = 0.9) +
+  facet_wrap(~scenario) +
+  labs(
+    title = "Effect of Population Size on Epidemic Variability",
+    x     = "Time (days)",
+    y     = "Proportion New Infections (5-Day Avg)"
+  ) +
+  theme_minimal()
+```
+
+## Comparing Rolling Window Sizes
+
+The choice of rolling window width affects how much noise is removed and how much the smoothed curve lags behind the raw data. A 3-day window reacts quickly but retains more noise; a 7-day window is smoother but lags further behind the true trend. For peak detection, this lag matters: the smoothed peak will always appear slightly later than the true maximum of raw new infections.
+
+Figure 6 and Figure 7 show the baseline simulation (N = 500, $\beta = 0.3$) using all three window sizes, on both the raw and log-log scale.
+
+```{r rolling-raw, fig.cap="Rolling average new infections vs. cumulative infections for 3-, 5-, and 7-day windows. Baseline scenario."}
+rolling_long <- sim_df %>%
+  select(simulation, time, cumulative_I, log_cumI,
+         I_3day_avg, I_5day_avg, I_7day_avg) %>%
+  pivot_longer(
+    cols      = c(I_3day_avg, I_5day_avg, I_7day_avg),
+    names_to  = "window",
+    values_to = "avg"
+  ) %>%
+  mutate(
+    log_avg = log(avg),
+    window  = recode(window,
+                     I_3day_avg = "3-day",
+                     I_5day_avg = "5-day",
+                     I_7day_avg = "7-day"),
+    window = factor(window, levels = c("3-day", "5-day", "7-day"))
+  )
+
+ggplot(rolling_long, aes(x = cumulative_I, y = avg, group = simulation)) +
+  geom_line(alpha = 0.1, color = "purple") +
+  facet_wrap(~window) +
+  labs(
+    title = "Rolling Avg New Infections vs. Cumulative Infections",
+    x     = "Cumulative Infections",
+    y     = "Rolling Avg New Infections"
+  ) +
+  theme_minimal()
+```
+
+```{r rolling-loglog, fig.cap="Log-log plot of rolling average new infections vs. cumulative infections, by window size."}
+ggplot(rolling_long, aes(x = log_cumI, y = log_avg, group = simulation)) +
+  geom_line(alpha = 0.1, color = "purple") +
+  facet_wrap(~window) +
+  labs(
+    title = "Log-Log Plot by Rolling Window Size",
+    x     = "log(Cumulative Infections)",
+    y     = "log(Rolling Avg New Infections)"
+  ) +
+  theme_minimal()
+```
+
+# Validation: Slope-Based Peak Detection
+
+## Method
+
+The exploratory analysis above established that the log-log curve turns downward at the epidemic peak. Here we formalize this into a detection algorithm and evaluate its accuracy retrospectively across all 1000 simulations.
+
+The algorithm works as follows. At each time step, we compute the slope of the log-log curve as the discrete derivative:
+
+$$\text{slope}_t = \frac{\Delta \log(\text{rolling avg new infections})}{\Delta \log(\text{cumulative infections})}$$
+
+This slope is positive during the growth phase and negative after the peak. To avoid declaring a false peak due to a single noisy dip, we require the slope to be negative for at least $K$ consecutive time steps before we declare detection. The detected peak day is then defined as the first day of that sustained negative streak, meaning it is the day the algorithm would have fired had it been running in real time.
+
+We then compare the detected peak day to the true peak day (the day `I_5day_avg` is highest in each simulation) and compute the lag: detected minus true. A positive lag means the algorithm fires late; a negative lag would mean it fires early.
+
+We also test sensitivity to the choice of $K$ by repeating the analysis for $K = 2, 3, 4, 5$.
+
+## Detection Algorithm
+
+```{r detection-function}
+detect_peak_loglog <- function(df, K = 3) {
+  df %>%
+    arrange(simulation, time) %>%
+    group_by(simulation) %>%
+    mutate(
+      slope     = c(NA, diff(log_5dayI) / diff(log_cumI)),
+      slope_neg = !is.na(slope) & is.finite(slope) & slope < 0,
+      consec_neg = rollapply(slope_neg, width = K, FUN = all,
+                             fill = FALSE, align = "right")
+    ) %>%
+    summarise(
+      actual_peak   = time[which.max(I_5day_avg)[1]],
+      detected_peak = {
+        candidates <- time[consec_neg]
+        if (length(candidates) > 0) min(candidates) else NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    mutate(lag = detected_peak - actual_peak)
+}
+```
+
+## Baseline Results (K = 3)
+
+We first apply the algorithm to the baseline scenario ($\beta = 0.3$, $N = 500$) with $K = 3$.
+
+```{r detection-baseline}
+detection_df <- detect_peak_loglog(sim_df, K = 3)
+
+median_lag  <- median(detection_df$lag, na.rm = TRUE)
+mean_lag    <- round(mean(detection_df$lag, na.rm = TRUE), 1)
+pct_na      <- round(100 * mean(is.na(detection_df$detected_peak)), 1)
+```
+
+Of the 1000 simulations, `r pct_na`% did not produce a detectable peak (the slope never sustained $K$ consecutive negative values within the time window). Among the rest, the algorithm fired a median of `r median_lag` days after the true peak.
+
+```{r detection-example, fig.cap="Single representative simulation showing the true peak (blue) and the algorithm-detected peak (red dashed). The shaded region shows the lag between them."}
+# Pick example sim near the median lag
+example_sim2 <- detection_df %>%
+  filter(!is.na(lag)) %>%
+  mutate(dist = abs(lag - median_lag)) %>%
+  arrange(dist) %>%
+  slice(1) %>%
+  pull(simulation)
+
+ex_df   <- sim_df %>% filter(simulation == example_sim2)
+ex_det  <- detection_df %>% filter(simulation == example_sim2)
+
+ggplot(ex_df, aes(x = log_cumI, y = log_5dayI)) +
+  geom_line(color = "purple", size = 0.9) +
+  geom_vline(xintercept = ex_df$log_cumI[which.max(ex_df$I_5day_avg)],
+             color = "blue", linetype = "dashed", size = 0.8) +
+  geom_vline(xintercept = ex_df$log_cumI[ex_df$time == ex_det$detected_peak],
+             color = "red", linetype = "dashed", size = 0.8) +
+  annotate("text", x = ex_df$log_cumI[which.max(ex_df$I_5day_avg)],
+           y = -Inf, label = "True peak", color = "blue",
+           hjust = 1.1, vjust = -0.5, size = 3.5) +
+  annotate("text", x = ex_df$log_cumI[ex_df$time == ex_det$detected_peak],
+           y = -Inf, label = "Detected", color = "red",
+           hjust = -0.1, vjust = -0.5, size = 3.5) +
+  labs(
+    title    = "Log-Log Curve with True and Detected Peak",
+    subtitle = paste("Lag =", ex_det$lag, "days"),
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Infections)"
+  ) +
+  theme_minimal()
+```
+
+```{r detection-hist, fig.cap="Distribution of lag (detected peak minus true peak) across 1000 simulations. Positive values indicate the algorithm fires after the true peak."}
+ggplot(detection_df, aes(x = lag)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = median_lag, color = "red", linetype = "dashed", size = 0.8) +
+  annotate("text", x = median_lag + 0.3, y = Inf,
+           label = paste("Median lag =", median_lag, "days"),
+           hjust = 0, vjust = 1.5, size = 3.5, color = "red") +
+  labs(
+    title    = "Lag Between Detected and True Peak (K = 3)",
+    subtitle = "Positive = algorithm fires after true peak",
+    x        = "Lag (days)",
+    y        = "Number of Simulations"
+  ) +
+  theme_minimal()
+```
+
+## Sensitivity to K
+
+A larger $K$ requires a longer sustained decline before declaring a peak, which reduces false alarms but increases the lag. Figure below shows how the distribution of lags shifts as $K$ varies from 2 to 5.
+
+```{r detection-sensitivity, fig.cap="Distribution of detection lag for K = 2, 3, 4, 5. Larger K delays detection but may be more robust to noise."}
+sensitivity_df <- bind_rows(
+  lapply(2:5, function(k) {
+    detect_peak_loglog(sim_df, K = k) %>% mutate(K = paste0("K = ", k))
+  })
+)
+
+ggplot(sensitivity_df, aes(x = lag)) +
+  geom_histogram(binwidth = 1, fill = "coral", color = "white", alpha = 0.8) +
+  geom_vline(data = sensitivity_df %>%
+               group_by(K) %>%
+               summarise(med = median(lag, na.rm = TRUE), .groups = "drop"),
+             aes(xintercept = med), color = "black", linetype = "dashed") +
+  facet_wrap(~K) +
+  labs(
+    title = "Detection Lag Sensitivity to K",
+    x     = "Lag (days)",
+    y     = "Number of Simulations"
+  ) +
+  theme_minimal()
+```
+
+# Temporal Convergence in Log-Log Space
+
+The log-log plot has no time axis, cumulative infections and smoothed new infections are on the two axes, but the day of the simulation is implicit. This raises a natural question: do different simulations move through log-log space at the same pace? If two simulations trace similar log-log curves but one reaches the peak on day 12 and the other on day 22, the log-log shape alone cannot tell them apart. Understanding how tightly the simulations cluster at each day, or their *convergence* in log-log space, tells us how reliably we can read timing off the graph.
+
+## Option 1: The Beaded Necklace Plot
+
+We select 10 individual simulations at random and plot their log-log curves, marking the position of each day as a dot. Each dot is one day's observation; consecutive dots on the same curve are one day apart. Wide spacing between dots means the epidemic moved quickly through log-log space that day; tight spacing means it moved slowly. Looking across the 10 simulations at any given dot-number shows how synchronized they are at that point in time.
+
+```{r convergence-beads, fig.cap="Log-log curves for 10 randomly selected simulations, with a dot marking each day. Wide spacing = fast epidemic movement through log-log space. Clustering of same-numbered dots across simulations indicates temporal convergence."}
+set.seed(42)
+sample_sims <- sample(unique(sim_df$simulation), 10)
+
+beads_df <- sim_df %>%
+  filter(simulation %in% sample_sims) %>%
+  filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+ggplot(beads_df, aes(x = log_cumI, y = log_5dayI,
+                     group = factor(simulation),
+                     color = factor(simulation))) +
+  geom_line(alpha = 0.5, size = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  scale_color_brewer(palette = "Paired") +
+  labs(
+    title    = "Log-Log Trajectories for 10 Simulations (One Dot = One Day)",
+    subtitle = "Dot spacing shows epidemic speed; alignment across curves shows convergence",
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Infections)",
+    color    = "Simulation"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Option 2: Cross-Sectional Slices
+
+We now use all 1000 simulations. All log-log curves are shown as a faint grey background, and then we overlay coloured dots showing where every simulation sits on the log-log plot at specific days: day 5, 10, 15, 20, and 25. A tight cluster of same-coloured dots means simulations are in nearly the same log-log position on that day. A wide scatter means the simulations are at very different epidemic stages despite being the same number of days in.
+
+```{r convergence-slices, fig.cap="All 1000 log-log curves (grey) with coloured dots marking each simulation's position at days 5, 10, 15, 20, and 25. Tighter clusters indicate stronger temporal convergence."}
+slice_days <- c(5, 10, 15, 20, 25)
+
+slice_df <- sim_df %>%
+  filter(time %in% slice_days) %>%
+  filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+background_df <- sim_df %>%
+  filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+ggplot(background_df, aes(x = log_cumI, y = log_5dayI, group = simulation)) +
+  geom_line(alpha = 0.02, color = "grey40") +
+  geom_point(data = slice_df,
+             aes(x = log_cumI, y = log_5dayI, color = factor(time)),
+             size = 1.2, alpha = 0.4) +
+  scale_color_brewer(palette = "RdYlBu", direction = -1, name = "Day") +
+  labs(
+    title    = "Cross-Sectional Slices Through Log-Log Space",
+    subtitle = "Coloured dots show where all 1000 simulations sit at days 5, 10, 15, 20, 25",
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Infections)"
+  ) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 3)))
+```
+
+## Option 3: Spread Over Time
+
+To quantify convergence directly, we compute the interquartile range (IQR) of the log-log y-axis across all 1000 simulations at each day. A narrow IQR means most simulations are at a similar incidence level on that day; a wide IQR means they are spread out. The red dashed line marks the median peak day from the baseline analysis, so we can see whether convergence is tightest before, at, or after the epidemic peak.
+
+```{r convergence-spread, fig.cap="IQR of log(5-day avg new infections) across 1000 simulations at each day. A narrowing IQR indicates convergence — simulations agree more on the current incidence level. Red dashed line marks the median peak day."}
+spread_df <- sim_df %>%
+  filter(is.finite(log_5dayI)) %>%
+  group_by(time) %>%
+  summarise(
+    iqr    = IQR(log_5dayI, na.rm = TRUE),
+    median = median(log_5dayI, na.rm = TRUE),
+    q25    = quantile(log_5dayI, 0.25, na.rm = TRUE),
+    q75    = quantile(log_5dayI, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(spread_df, aes(x = time, y = iqr)) +
+  geom_ribbon(aes(ymin = 0, ymax = iqr), fill = "steelblue", alpha = 0.2) +
+  geom_line(color = "steelblue", size = 0.9) +
+  geom_vline(xintercept = median_peak, color = "red",
+             linetype = "dashed", size = 0.8) +
+  annotate("text", x = median_peak + 0.5, y = Inf,
+           label = paste("Median peak =", median_peak),
+           hjust = 0, vjust = 1.5, color = "red", size = 3.5) +
+  labs(
+    title    = "Temporal Convergence: Spread of Log-Log Position Over Time",
+    subtitle = "IQR of log(5-day avg new infections) across 1000 simulations",
+    x        = "Time (days)",
+    y        = "IQR of log(5-Day Avg New Infections)"
+  ) +
+  theme_minimal()
+```
+
+## Option 4: Convergence of Time Within a Single Simulation
+
+The previous plots describe convergence *across* simulations. But there is a separate and complementary phenomenon visible *within* a single simulation: as the epidemic approaches its peak, consecutive days produce smaller and smaller movements on the log-log curve. The dots get closer together and time appears to slow down on the log-log plot. This is what we call convergence of time.
+
+The reason this happens is that near the peak, cumulative infections are still growing but daily new infections have plateaued. Both axes are barely changing, so each passing day moves the curve only a tiny amount. Before the peak, by contrast, both axes are growing rapidly and each day covers a large distance on the log-log plane.
+
+Figure below shows a single representative simulation with a dot at every day, colored from blue (early) to red (late). Day labels are shown every 5 days and at the peak. The narrowing gap between consecutive dots as you approach the peak is the convergence of time.
+
+```{r convergence-single-sim, fig.cap="Single simulation log-log trajectory with one dot per day. Blue = early days, red = late days. Labels shown every 5 days and at the peak. Dots converge near the peak, showing that each passing day produces less movement on the log-log curve."}
+# Use the representative simulation identified earlier
+single_df <- sim_df %>%
+  filter(simulation == example_sim) %>%
+  filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+peak_day_single <- single_df$time[which.max(single_df$I_5day_avg)]
+
+# Label every 5th day and the peak day
+label_days <- unique(c(seq(5, max(single_df$time), by = 5), peak_day_single))
+label_df   <- single_df %>% filter(time %in% label_days)
+
+ggplot(single_df, aes(x = log_cumI, y = log_5dayI)) +
+  geom_line(color = "grey70", size = 0.5) +
+  geom_point(aes(color = time), size = 2.2) +
+  # Highlight the peak day with a distinct symbol
+  geom_point(data = single_df %>% filter(time == peak_day_single),
+             aes(x = log_cumI, y = log_5dayI),
+             shape = 21, size = 5, color = "black", fill = "yellow", stroke = 1.2) +
+  geom_text(data = label_df,
+            aes(label = paste0("d", time)),
+            size = 2.8, vjust = -1, hjust = 0.5) +
+  scale_color_gradient(low = "steelblue", high = "red", name = "Day") +
+  labs(
+    title    = "Convergence of Time in a Single Simulation",
+    subtitle = "Each dot = one day. Dots converge near the peak (yellow circle) as the epidemic slows in log-log space.",
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Infections)"
+  ) +
+  theme_minimal()
+```
+
+# Empirical Validation: COVID-19 Wave 1 in New York State
+
+So far all analysis has been conducted on simulated data where the ground truth is known. Here we apply the same log-log framework to real-world data from New York State's COVID-19 testing records. The goal is to ask: does the log-log curve trace the same inverted-U shape in real data, and does the slope-based detection algorithm correctly identify the epidemic peak?
+
+We focus on the first wave of COVID-19 in New York State (March–June 2020). This wave is the most suitable for comparison with the SIR model because it represents a largely naive population with no prior immunity or vaccination, producing a single epidemic arc with a clear peak. Later waves are complicated by variants, vaccination, and prior immunity, which violate the SIR model's assumptions.
+
+## Data Loading and Cleaning
+
+```{r covid-load}
+library(lubridate)
+
+# Load raw data — county-level rows plus a STATEWIDE aggregate per day
+covid_raw <- read.csv(
+  "/Users/juliabraunig/Desktop/Trikalinos/New_York_State_Statewide_COVID-19_Testing_20260522.csv",
+  stringsAsFactors = FALSE,
+  check.names      = TRUE
+)
+
+# Filter to statewide aggregate, parse dates, strip commas from case counts
+covid_state <- covid_raw %>%
+  filter(Geography.Level == "STATEWIDE") %>%
+  mutate(
+    date          = mdy(Test.Date),
+    new_positives = as.numeric(gsub(",", "", Total.New.Positives))
+  ) %>%
+  arrange(date) %>%
+  select(date, new_positives)
+
+# Isolate Wave 1: March 1 – June 30, 2020
+wave1 <- covid_state %>%
+  filter(date >= as.Date("2020-03-01"),
+         date <= as.Date("2020-06-30")) %>%
+  mutate(
+    time         = as.numeric(date - min(date)),  # day 0 = March 1
+    cumulative_I = cumsum(new_positives),
+    I_3day_avg   = rollmean(new_positives, k = 3, fill = NA, align = "right"),
+    I_5day_avg   = rollmean(new_positives, k = 5, fill = NA, align = "right"),
+    I_7day_avg   = rollmean(new_positives, k = 7, fill = NA, align = "right"),
+    log_cumI     = log(cumulative_I),
+    log_3dayI    = log(I_3day_avg),
+    log_5dayI    = log(I_5day_avg),
+    log_7dayI    = log(I_7day_avg)
+  )
+```
+
+## Wave 1 Time Series
+
+The raw daily case counts are noisy as weekend reporting delays and testing capacity fluctuations create artificial spikes and dips. The 5-day rolling average smooths these out to reveal the underlying epidemic trajectory. The true peak of the smoothed curve and the algorithm-detected peak are marked as vertical lines.
+
+```{r covid-timeseries, fig.cap="NY State COVID-19 Wave 1 daily new cases (bars) and 5-day rolling average (line). Blue dashed line = true smoothed peak; red dashed line = algorithm-detected peak (K=5)."}
+# Run detection on wave 1 (single time series version)
+# K=5: require 5 consecutive days of negative slope before declaring peak.
+# Chosen as a middle ground — K=3 (from simulations) risks false alarms from
+# reporting noise; K=10 was too strict and never fired on real data.
+wave1_det <- wave1 %>%
+  arrange(time) %>%
+  mutate(
+    slope      = c(NA, diff(log_5dayI) / diff(log_cumI)),
+    slope_neg  = !is.na(slope) & is.finite(slope) & slope < 0,
+    consec_neg = rollapply(slope_neg, width = 5, FUN = all,
+                           fill = FALSE, align = "right")
+  )
+
+actual_peak_date   <- wave1_det$date[which.max(wave1_det$I_5day_avg)]
+detected_peak_date <- wave1_det$date[which(wave1_det$consec_neg)[1]]
+lag_covid          <- as.numeric(detected_peak_date - actual_peak_date)
+
+ggplot(wave1_det, aes(x = date)) +
+  geom_col(aes(y = new_positives), fill = "grey80", width = 1) +
+  geom_line(aes(y = I_5day_avg), color = "purple", size = 0.9) +
+  geom_vline(xintercept = actual_peak_date,
+             color = "blue", linetype = "dashed", size = 0.8) +
+  geom_vline(xintercept = detected_peak_date,
+             color = "red", linetype = "dashed", size = 0.8) +
+  annotate("text", x = actual_peak_date, y = Inf,
+           label = paste0("True peak\n", actual_peak_date),
+           color = "blue", hjust = 1.1, vjust = 1.5, size = 3) +
+  annotate("text", x = detected_peak_date, y = Inf,
+           label = paste0("Detected\n", detected_peak_date),
+           color = "red", hjust = -0.1, vjust = 1.5, size = 3) +
+  labs(
+    title    = "NY State COVID-19 Wave 1: Daily New Cases",
+    subtitle = paste0("Detection lag = ", lag_covid, " days (K = 3)"),
+    x        = "Date",
+    y        = "Daily New Positive Cases"
+  ) +
+  theme_minimal()
+```
+
+## Log-Log Curve for Wave 1
+
+The log-log curve for the real data should trace the same inverted-U shape observed in simulations if the SIR model is a reasonable approximation. Every day is marked as a dot colored from blue (early) to red (late), with date labels every 7 days so you can read off when different parts of the curve occur. The true peak (large blue dot) and algorithm-detected peak (large red dot) are also marked.
+
+```{r covid-loglog, fig.cap="Log-log curve for NY State COVID-19 Wave 1 with daily dots colored by date. Labels shown every 7 days. Large blue dot = true smoothed peak; large red dot = algorithm-detected peak (K=5)."}
+wave1_plot <- wave1_det %>% filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+wave1_peak_row   <- wave1_det %>% filter(date == actual_peak_date)
+wave1_detect_row <- wave1_det %>% filter(date == detected_peak_date)
+
+# Label every 7 days plus the true peak and detected peak dates
+label_dates <- unique(c(
+  seq(min(wave1_plot$date), max(wave1_plot$date), by = 7),
+  actual_peak_date,
+  detected_peak_date
+))
+label_df <- wave1_plot %>% filter(date %in% label_dates)
+
+ggplot(wave1_plot, aes(x = log_cumI, y = log_5dayI)) +
+  geom_line(color = "grey70", size = 0.5) +
+  # Daily dots colored by date
+  geom_point(aes(color = as.numeric(date)), size = 2, alpha = 0.8) +
+  scale_color_gradient(
+    low    = "steelblue",
+    high   = "red",
+    name   = "Date",
+    labels = function(x) format(as.Date(x, origin = "1970-01-01"), "%b %d"),
+    breaks = as.numeric(range(wave1_plot$date))
+  ) +
+  # Date labels every 7 days
+  geom_text(data = label_df,
+            aes(label = format(date, "%b %d")),
+            size = 2.5, vjust = -0.9, hjust = 0.5, color = "grey30") +
+  # True peak
+  geom_point(data = wave1_peak_row,
+             aes(x = log_cumI, y = log_5dayI),
+             color = "blue", size = 5, shape = 16) +
+  annotate("text", x = wave1_peak_row$log_cumI, y = wave1_peak_row$log_5dayI,
+           label = paste0("True peak\n", format(actual_peak_date, "%b %d")),
+           color = "blue", hjust = 1.2, size = 3.2) +
+  # Detected peak
+  geom_point(data = wave1_detect_row,
+             aes(x = log_cumI, y = log_5dayI),
+             color = "red", size = 5, shape = 16) +
+  annotate("text", x = wave1_detect_row$log_cumI, y = wave1_detect_row$log_5dayI,
+           label = paste0("Detected\n", format(detected_peak_date, "%b %d")),
+           color = "red", hjust = -0.2, size = 3.2) +
+  labs(
+    title    = "Log-Log Curve: NY State COVID-19 Wave 1",
+    subtitle = paste0("Each dot = one day. Detection lag = ", lag_covid, " days (K = 5)"),
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Cases)"
+  ) +
+  theme_minimal()
+```
+
+## Comparing Rolling Window Sizes on Real Data
+
+As with the simulated data, we compare how the 3-, 5-, and 7-day windows affect the shape of the log-log curve and the position of the peak on real data.
+
+```{r covid-rolling, fig.cap="Log-log curves for NY State Wave 1 using 3-, 5-, and 7-day rolling averages. Wider windows produce smoother curves but shift the detected peak slightly later."}
+wave1_long <- wave1_det %>%
+  filter(is.finite(log_cumI)) %>%
+  select(date, time, cumulative_I, log_cumI,
+         I_3day_avg, I_5day_avg, I_7day_avg) %>%
+  pivot_longer(
+    cols      = c(I_3day_avg, I_5day_avg, I_7day_avg),
+    names_to  = "window",
+    values_to = "avg"
+  ) %>%
+  mutate(
+    log_avg = log(avg),
+    window  = recode(window,
+                     I_3day_avg = "3-day",
+                     I_5day_avg = "5-day",
+                     I_7day_avg = "7-day"),
+    window = factor(window, levels = c("3-day", "5-day", "7-day"))
+  )
+
+ggplot(wave1_long %>% filter(is.finite(log_avg)),
+       aes(x = log_cumI, y = log_avg)) +
+  geom_line(color = "purple", size = 0.9) +
+  facet_wrap(~window) +
+  labs(
+    title = "Log-Log Curve by Rolling Window Size — COVID Wave 1",
+    x     = "log(Cumulative Infections)",
+    y     = "log(Rolling Avg New Cases)"
+  ) +
+  theme_minimal()
+```
+
+## Alternative Detection Method: Polynomial Fit
+
+The K-based slope method detects the peak by waiting for K consecutive days of negative slope which always introduces a lag by design. An alternative approach is to fit a smooth polynomial curve directly to the log-log data and find its mathematical maximum analytically. This makes a single geometric statement about the shape of the entire curve rather than watching it day by day, and fires exactly at the predicted peak with no required confirmation window.
+
+We fit a cubic polynomial (degree 3) to the log-log curve. A cubic can capture the asymmetry of the epidemic unlike a quadratic which forces symmetry. We then predict the fitted curve over a fine grid of x values and find the x position where the prediction is highest. The date in the real data whose log(cumulative infections) is closest to that predicted peak position is declared the detected peak.
+
+```{r covid-poly-fit, fig.cap="Log-log curve for COVID Wave 1 with a cubic polynomial fit overlaid (green). The green dot marks the polynomial-predicted peak; the blue dot marks the true smoothed peak."}
+loglog_data <- wave1_det %>%
+  filter(is.finite(log_cumI), is.finite(log_5dayI))
+
+# Fit cubic polynomial to log-log curve
+poly_fit <- lm(log_5dayI ~ poly(log_cumI, 3), data = loglog_data)
+
+# Predict over fine grid to find mathematical maximum
+x_grid <- seq(min(loglog_data$log_cumI), max(loglog_data$log_cumI), length.out = 5000)
+y_pred <- predict(poly_fit, newdata = data.frame(log_cumI = x_grid))
+
+# x position of the predicted maximum
+x_peak_poly <- x_grid[which.max(y_pred)]
+
+# Match back to the closest real date
+poly_peak_row  <- loglog_data %>%
+  mutate(dist = abs(log_cumI - x_peak_poly)) %>%
+  arrange(dist) %>%
+  slice(1)
+
+poly_peak_date <- poly_peak_row$date
+poly_lag       <- as.numeric(poly_peak_date - actual_peak_date)
+
+# Fitted curve for plotting
+fit_curve <- data.frame(log_cumI = x_grid, log_5dayI = y_pred)
+
+ggplot(loglog_data, aes(x = log_cumI, y = log_5dayI)) +
+  geom_line(color = "grey70", size = 0.5) +
+  geom_point(aes(color = as.numeric(date)), size = 2, alpha = 0.8) +
+  scale_color_gradient(
+    low    = "steelblue",
+    high   = "red",
+    name   = "Date",
+    labels = function(x) format(as.Date(x, origin = "1970-01-01"), "%b %d"),
+    breaks = as.numeric(range(loglog_data$date))
+  ) +
+  # Fitted polynomial curve
+  geom_line(data = fit_curve, aes(x = log_cumI, y = log_5dayI),
+            color = "darkgreen", size = 1, inherit.aes = FALSE) +
+  # True peak
+  geom_point(data = wave1_peak_row,
+             aes(x = log_cumI, y = log_5dayI),
+             color = "blue", size = 5, shape = 16, inherit.aes = FALSE) +
+  annotate("text", x = wave1_peak_row$log_cumI, y = wave1_peak_row$log_5dayI,
+           label = paste0("True peak\n", format(actual_peak_date, "%b %d")),
+           color = "blue", hjust = 1.2, size = 3.2) +
+  # Polynomial-predicted peak
+  geom_point(data = poly_peak_row,
+             aes(x = log_cumI, y = log_5dayI),
+             color = "darkgreen", size = 5, shape = 16, inherit.aes = FALSE) +
+  annotate("text", x = poly_peak_row$log_cumI, y = poly_peak_row$log_5dayI,
+           label = paste0("Poly peak\n", format(poly_peak_date, "%b %d")),
+           color = "darkgreen", hjust = -0.2, size = 3.2) +
+  labs(
+    title    = "Polynomial Fit to Log-Log Curve — COVID Wave 1",
+    subtitle = paste0("Green curve = cubic fit. Polynomial detection lag = ",
+                      poly_lag, " days vs true smoothed peak"),
+    x        = "log(Cumulative Infections)",
+    y        = "log(5-Day Avg New Cases)"
+  ) +
+  theme_minimal()
+```
+
+```{r covid-method-comparison}
+# Side-by-side summary of both detection methods
+comparison <- data.frame(
+  Method         = c("K-based slope (K=5)", "Cubic polynomial fit"),
+  Detected_Date  = c(format(detected_peak_date, "%b %d %Y"),
+                     format(poly_peak_date,      "%b %d %Y")),
+  True_Peak_Date = format(actual_peak_date, "%b %d %Y"),
+  Lag_Days       = c(lag_covid, poly_lag)
+)
+
+knitr::kable(comparison,
+             caption = "Comparison of peak detection methods against the true smoothed peak.",
+             col.names = c("Method", "Detected Date", "True Peak Date", "Lag (days)"))
+```
